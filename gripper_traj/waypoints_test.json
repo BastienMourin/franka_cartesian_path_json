@@ -1,0 +1,29 @@
+{
+  "handles": [
+    {
+      "handle_id": 0,
+      "handle_vertex_index": 0,
+      "frame_id":"fr3_link0",
+      "grasp_position": [0.5, 0.0, 0.2],
+      "surface_normal": [0.0, 0.0, 1.0],
+      "waypoints": [
+        {"t": 0.0, "position": [0.5, 0.0, 0.20], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 1.0, "position": [0.5, 0.0, 0.22], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 2.0, "position": [0.5, 0.0, 0.24], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 3.0, "position": [0.5, 0.0, 0.26], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 4.0, "position": [0.5, 0.0, 0.28], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 5.0, "position": [0.5, 0.0, 0.30], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 6.0, "position": [0.5, 0.0, 0.32], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 7.0, "position": [0.5, 0.0, 0.34], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 8.0, "position": [0.5, 0.0, 0.36], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 9.0, "position": [0.5, 0.0, 0.38], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 10.0, "position": [0.5, 0.0, 0.40], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 11.0, "position": [0.5, 0.0, 0.42], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 12.0, "position": [0.5, 0.0, 0.44], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 13.0, "position": [0.5, 0.0, 0.46], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 14.0, "position": [0.5, 0.0, 0.48], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]},
+        {"t": 15.0, "position": [0.5, 0.0, 0.50], "quaternion_wxyz": [0, 1, 0, 0], "rotation_matrix": [[1,0,0],[0,1,0],[0,0,1]]}
+      ]
+    }
+  ]
+}

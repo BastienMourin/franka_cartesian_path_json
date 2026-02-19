@@ -1,1 +1,1 @@
-# franka_cartesian_path_json
+# ignacio_cartesian_pose_json

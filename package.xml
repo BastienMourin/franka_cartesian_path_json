@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>ignacio_cartesian_pose_json</name>
+  <version>0.1.0</version>
+  <description>Dual Franka MoveIt2 control package</description>
+  <maintainer email="you@example.com">Your Name</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <buildtool_depend>ament_cmake_python</buildtool_depend>
+
+  <!-- Dependencies -->
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>launch</depend>
+  <depend>launch_ros</depend>
+  <depend>franka_bringup</depend>
+  <depend>franka_moveit_config</depend>
+  <depend>moveit_ros_planning_interface</depend>
+  <depend>yaml-cpp</depend>
+  <depend>eigen</depend>
+  <depend>tf2_geometry_msgs</depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
+

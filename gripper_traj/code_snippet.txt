@@ -1,0 +1,36 @@
+    profile_path = MESH_OUTPUT_DIR / f"action_profiles_{method_name}.json"
+    if not profile_path.exists():
+        print(f"  ERROR: Profile not found")
+        return None
+    
+    with open(profile_path, 'r') as f:
+        profiles = json.load(f)
+    
+    meta = profiles['metadata']
+    K = meta['n_handles']
+    n_steps_profile = meta['n_steps']
+    radius = saved_gripper_radius or meta['influence_radius']
+    
+    print(f"  {K} handles, {n_steps_profile} steps, radius={radius:.4f}")
+    
+    # Extract trajectories
+    handle_centroids = np.zeros((n_steps_profile, K, 3))
+    handle_rotations = np.zeros((n_steps_profile, K, 3, 3))
+    handle_indices = []
+    
+    for h in profiles['handles']:
+        k = h['handle_id']
+        handle_indices.append(h['handle_vertex_index'])
+        for wp in h['waypoints']:
+            step = int(wp['t'] * (n_steps_profile - 1) + 0.5)
+            handle_centroids[step, k] = wp['position']
+            handle_rotations[step, k] = np.array(wp['rotation_matrix'])
+    
+    handle_indices = np.array(handle_indices)
+    
+    # Subsample if needed
+    n_steps = min(n_steps_profile, VALIDATION_N_SIM_STEPS)
+    if n_steps < n_steps_profile:
+        indices = np.linspace(0, n_steps_profile - 1, n_steps, dtype=int)
+        handle_centroids = handle_centroids[indices]
+        handle_rotations = handle_rotations[indices]
