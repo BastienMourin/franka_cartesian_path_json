@@ -106,7 +106,7 @@ int main(int argc, char **argv)
     std::string package_path =
         ament_index_cpp::get_package_share_directory("ignacio_cartesian_pose_json");
 
-    node->declare_parameter("waypoints_file", "waypoints_test_camera.json");
+    node->declare_parameter("waypoints_file", "waypoints_test.json");
     std::string filename =
         package_path + "/gripper_traj/" +
         node->get_parameter("waypoints_file").as_string();

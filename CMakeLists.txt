@@ -34,6 +34,10 @@ add_executable(franka_cartesian_path_json_dual
   src/franka_cartesian_path_json_dual.cpp
 )
 
+add_executable(franka_cartesian_path_json_increments
+  src/franka_cartesian_path_json_increments.cpp
+)
+
 # Target dependencies for franka_cartesian_path_json_moveit
 ament_target_dependencies(franka_cartesian_path_json_moveit
   rclcpp
@@ -73,9 +77,22 @@ target_link_libraries(franka_cartesian_path_json_dual
   Eigen3::Eigen
 )
 
+# Target dependencies for franka_cartesian_path_json_increments
+ament_target_dependencies(franka_cartesian_path_json_increments
+  rclcpp
+  geometry_msgs
+  tf2_ros
+  moveit_ros_planning_interface
+)
+
+target_link_libraries(franka_cartesian_path_json_increments
+  yaml-cpp
+  Eigen3::Eigen
+)
+
 
 # Install executables
-install(TARGETS franka_cartesian_path_json_moveit franka_cartesian_path_json franka_cartesian_path_json_dual
+install(TARGETS franka_cartesian_path_json_moveit franka_cartesian_path_json franka_cartesian_path_json_dual franka_cartesian_path_json_increments
   DESTINATION lib/${PROJECT_NAME}
 )
 
