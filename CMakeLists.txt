@@ -15,6 +15,8 @@ find_package(moveit_ros_planning_interface REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
+
 
 # Include directories
 include_directories(
@@ -42,11 +44,19 @@ add_executable(franka_cartesian_path_json_dual_increments
   src/franka_cartesian_path_json_dual_increments.cpp
 )
 
+
+# franka_cartesian_path_json_dual_increments
+ament_target_dependencies(franka_cartesian_path_json_dual_increments
+  rclcpp geometry_msgs tf2_ros tf2_geometry_msgs
+  moveit_ros_planning_interface visualization_msgs
+)
+
 # Target dependencies for franka_cartesian_path_json_moveit
 ament_target_dependencies(franka_cartesian_path_json_moveit
   rclcpp
   geometry_msgs
   tf2_ros
+  tf2_geometry_msgs
   moveit_ros_planning_interface
 )
 
@@ -60,7 +70,7 @@ ament_target_dependencies(franka_cartesian_path_json
   rclcpp
   geometry_msgs
   tf2_ros
-  moveit_ros_planning_interface
+  tf2_geometry_msgs
 )
 
 target_link_libraries(franka_cartesian_path_json
@@ -73,7 +83,7 @@ ament_target_dependencies(franka_cartesian_path_json_dual
   rclcpp
   geometry_msgs
   tf2_ros
-  moveit_ros_planning_interface
+  tf2_geometry_msgs
 )
 
 target_link_libraries(franka_cartesian_path_json_dual
@@ -86,7 +96,7 @@ ament_target_dependencies(franka_cartesian_path_json_increments
   rclcpp
   geometry_msgs
   tf2_ros
-  moveit_ros_planning_interface
+  tf2_geometry_msgs
 )
 
 target_link_libraries(franka_cartesian_path_json_increments
@@ -99,7 +109,8 @@ ament_target_dependencies(franka_cartesian_path_json_dual_increments
   rclcpp
   geometry_msgs
   tf2_ros
-  moveit_ros_planning_interface
+  tf2_geometry_msgs
+  visualization_msgs
 )
 
 target_link_libraries(franka_cartesian_path_json_dual_increments

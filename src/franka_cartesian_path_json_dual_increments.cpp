@@ -1,6 +1,7 @@
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/point.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <ament_index_cpp/get_package_share_directory.hpp>
@@ -28,6 +29,95 @@ static const std::map<int, HandleConfig> HANDLE_CONFIG = {
     {0, {"/NS1", "NS1_fr3_link0"}},
     {1, {"/NS2", "NS2_fr3_link0"}},
 };
+
+// ==========================================================
+// Debug marker helpers
+//
+// Two topics per handle:
+//   /debug/handle_<N>/waypoints_camera     – raw cumulative_position
+//                                            expressed in camera frame
+//                                            (LINE_STRIP + spheres)
+//   /debug/handle_<N>/waypoints_link0      – computed target positions
+//                                            in fr3_link0
+//                                            (LINE_STRIP + spheres)
+//
+// Colours:
+//   camera  waypoints → cyan   (0, 1, 1)
+//   link0   waypoints → orange (1, 0.5, 0)
+//
+// Enable with ROS parameter:  --ros-args -p debug_markers:=true
+// ==========================================================
+
+// Per-handle debug publisher pair
+struct DebugPublishers {
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr camera_pub;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr link0_pub;
+};
+
+// Accumulate points; flushed once the whole trajectory is collected
+struct DebugTrajectory {
+    std::vector<geometry_msgs::msg::Point> camera_points;  // in camera frame
+    std::vector<geometry_msgs::msg::Point> link0_points;   // in link0 frame
+};
+
+// Build a MarkerArray with a LINE_STRIP + individual SPHERE_LIST from a
+// list of points.  id_offset separates the two channels so IDs don't clash.
+visualization_msgs::msg::MarkerArray buildMarkerArray(
+    const std::vector<geometry_msgs::msg::Point> &points,
+    const std::string &frame_id,
+    float r, float g, float b,
+    int id_offset,
+    const rclcpp::Time &stamp)
+{
+    visualization_msgs::msg::MarkerArray ma;
+
+    if (points.empty()) return ma;
+
+    // --- LINE_STRIP connecting all waypoints ---
+    visualization_msgs::msg::Marker line;
+    line.header.frame_id = frame_id;
+    line.header.stamp    = stamp;
+    line.ns              = "path";
+    line.id              = id_offset;
+    line.type            = visualization_msgs::msg::Marker::LINE_STRIP;
+    line.action          = visualization_msgs::msg::Marker::ADD;
+    line.scale.x         = 0.003;   // line width [m]
+    line.color.r = r; line.color.g = g; line.color.b = b; line.color.a = 0.9f;
+    line.pose.orientation.w = 1.0;
+    line.points          = points;
+    ma.markers.push_back(line);
+
+    // --- SPHERE_LIST marking each waypoint ---
+    visualization_msgs::msg::Marker spheres;
+    spheres.header       = line.header;
+    spheres.ns           = "waypoints";
+    spheres.id           = id_offset + 1;
+    spheres.type         = visualization_msgs::msg::Marker::SPHERE_LIST;
+    spheres.action       = visualization_msgs::msg::Marker::ADD;
+    spheres.scale.x = spheres.scale.y = spheres.scale.z = 0.008;
+    spheres.color        = line.color;
+    spheres.pose.orientation.w = 1.0;
+    spheres.points       = points;
+    ma.markers.push_back(spheres);
+
+    // --- ARROW at first waypoint to show starting point ---
+    if (!points.empty()) {
+        visualization_msgs::msg::Marker start_sphere;
+        start_sphere.header   = line.header;
+        start_sphere.ns       = "start";
+        start_sphere.id       = id_offset + 2;
+        start_sphere.type     = visualization_msgs::msg::Marker::SPHERE;
+        start_sphere.action   = visualization_msgs::msg::Marker::ADD;
+        start_sphere.pose.position = points.front();
+        start_sphere.pose.orientation.w = 1.0;
+        start_sphere.scale.x = start_sphere.scale.y = start_sphere.scale.z = 0.016;
+        start_sphere.color.r = 1.0f; start_sphere.color.g = 1.0f;
+        start_sphere.color.b = 0.0f; start_sphere.color.a = 1.0f;  // yellow = start
+        ma.markers.push_back(start_sphere);
+    }
+
+    return ma;
+}
 
 // ==========================================================
 // Look up the current pose of source_frame expressed in
@@ -143,16 +233,6 @@ geometry_msgs::msg::Pose applyDeltaPose(
 // ==========================================================
 // Rotate a displacement vector from source_frame into target_frame,
 // applying ROTATION ONLY (no translation/origin offset).
-//
-// Uses Vector3Stamped which TF transforms by rotating the vector
-// direction without adding the translation between frame origins.
-// This is the correct way to handle a delta/displacement: a vector
-// [0, 0, 0.02] in camera-Z becomes the equivalent direction in
-// fr3_link0, without any spurious offset from where the camera sits.
-//
-// Compare with transforming a PoseStamped (WRONG for deltas): that
-// would also add the full camera→link0 translation, turning a tiny
-// delta into a large jump on the first waypoint.
 // ==========================================================
 bool rotateDeltaPosition(
     const geometry_msgs::msg::Vector3 &delta_in,
@@ -192,28 +272,7 @@ bool rotateDeltaPosition(
 // ==========================================================
 // Re-express a delta quaternion from source_frame into target_frame
 // using the SIMILARITY TRANSFORM:
-//
 //   q_out = q_rot * q_delta * q_rot^{-1}
-//
-// where q_rot is the rotation from source_frame to target_frame.
-//
-// WHY NOT use tf_buffer.transform() on a QuaternionStamped?
-//   That function interprets the quaternion as an absolute orientation
-//   and applies the full rigid body transform, adding the camera's
-//   own mounting orientation as an offset. A JSON delta of [1,0,0,0]
-//   (identity = no rotation) would become the camera's orientation in
-//   link0 — causing unexpected rotation even when none is requested.
-//
-// WHY NOT pass raw_delta_ori through unchanged?
-//   That always interprets the rotation axis in fr3_link0 coordinates,
-//   ignoring frame_id entirely. "Rotate around camera-Z" would behave
-//   identically to "rotate around link0-Z".
-//
-// THE SIMILARITY TRANSFORM correctly re-expresses only the rotation
-//   AXIS into the new frame, leaving the rotation ANGLE unchanged.
-//   "Rotate 45° around camera-Z" becomes "rotate 45° around the
-//   camera-Z axis as expressed in fr3_link0 coordinates".
-//   Identity [1,0,0,0] remains identity after the transform.
 // ==========================================================
 bool rotateDeltaOrientation(
     const geometry_msgs::msg::Quaternion &q_delta_in,
@@ -228,7 +287,6 @@ bool rotateDeltaOrientation(
         return true;
     }
 
-    // Look up the rotation from source_frame to target_frame
     geometry_msgs::msg::TransformStamped tf_stamped;
     try {
         tf_stamped = tf_buffer.lookupTransform(
@@ -254,7 +312,6 @@ bool rotateDeltaOrientation(
         q_delta_in.y,
         q_delta_in.z);
 
-    // Similarity transform: rotate the axis into target_frame
     Eigen::Quaterniond q_out = (q_rot * q_delta * q_rot.inverse()).normalized();
 
     q_delta_out.w = q_out.w();
@@ -273,12 +330,13 @@ void publishHandle(
     const json handle,
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub,
     std::shared_ptr<tf2_ros::Buffer> tf_buffer,
-    const std::string target_frame,               // e.g. "NS1_fr3_link0"
-    const std::chrono::steady_clock::time_point t0)
+    const std::chrono::steady_clock::time_point t0,
+    bool debug_markers,
+    DebugPublishers debug_pubs)
 {
     int handle_id = handle["handle_id"].get<int>();
 
-    std::string frame_id = target_frame;
+    std::string frame_id = "camera_color_optical_frame";  // default if not specified in JSON
     if (handle.contains("frame_id"))
         frame_id = handle["frame_id"].get<std::string>();
 
@@ -286,8 +344,8 @@ void publishHandle(
     // Capture the starting TCP pose in the specific control frame
     // ----------------------------------------------------------
     geometry_msgs::msg::PoseStamped start_pose_in_link0;
-    std::string tcp_frame = (handle_id == 0) ? "NS1_fr3_hand_tcp" : "NS2_fr3_hand_tcp";
-    std::string control_frame = (handle_id == 0) ? "NS1_fr3_link0" : "NS2_fr3_link0";
+    std::string tcp_frame     = (handle_id == 0) ? "NS1_fr3_hand_tcp"  : "NS2_fr3_hand_tcp";
+    std::string control_frame = (handle_id == 0) ? "NS1_fr3_link0"     : "NS2_fr3_link0";
 
     if (!getCurrentPose(tcp_frame, control_frame, start_pose_in_link0, *tf_buffer, node->get_logger()))
     {
@@ -296,15 +354,97 @@ void publishHandle(
         return;
     }
 
+    // ----------------------------------------------------------
+    // Debug: pre-collect all waypoints into marker arrays so they
+    // are published as complete trajectories before execution starts.
+    // ----------------------------------------------------------
+    DebugTrajectory debug_traj;
+
+    if (debug_markers)
+    {
+        RCLCPP_INFO(node->get_logger(),
+            "[handle %d] Debug mode: pre-computing marker trajectories...", handle_id);
+
+        for (const auto &wp : handle["waypoints"])
+        {
+            // --- Camera-frame point (raw cumulative_position) ---
+            // cumulative_position is a displacement from the start, so
+            // we visualise it offset from the starting TCP position
+            // expressed in the camera frame.  We look up start_pose in
+            // camera frame for a meaningful origin.
+            geometry_msgs::msg::Point cam_pt;
+
+            // The raw delta is already in camera frame; use it directly
+            // relative to zero (the camera frame origin) so the shape is
+            // visible without needing the TCP camera-frame position.
+            cam_pt.x = wp["cumulative_position"][0].get<double>();
+            cam_pt.y = wp["cumulative_position"][1].get<double>();
+            cam_pt.z = wp["cumulative_position"][2].get<double>();
+            debug_traj.camera_points.push_back(cam_pt);
+
+            // --- Link0-frame point (start_pose + rotated delta) ---
+            geometry_msgs::msg::Vector3 raw_delta_pos;
+            raw_delta_pos.x = wp["cumulative_position"][0].get<double>();
+            raw_delta_pos.y = wp["cumulative_position"][1].get<double>();
+            raw_delta_pos.z = wp["cumulative_position"][2].get<double>();
+
+            geometry_msgs::msg::Point delta_in_link0;
+            if (!rotateDeltaPosition(raw_delta_pos, frame_id, control_frame,
+                                     delta_in_link0, *tf_buffer,
+                                     node->get_clock(), node->get_logger()))
+            {
+                RCLCPP_WARN(node->get_logger(),
+                    "[handle %d] Debug: could not rotate waypoint for marker, skipping.", handle_id);
+                continue;
+            }
+
+            geometry_msgs::msg::Point link0_pt;
+            link0_pt.x = start_pose_in_link0.pose.position.x + delta_in_link0.x;
+            link0_pt.y = start_pose_in_link0.pose.position.y + delta_in_link0.y;
+            link0_pt.z = start_pose_in_link0.pose.position.z + delta_in_link0.z;
+            debug_traj.link0_points.push_back(link0_pt);
+        }
+
+        // Publish camera-frame markers (cyan)
+        auto stamp = node->get_clock()->now();
+        auto ma_cam = buildMarkerArray(
+            debug_traj.camera_points,
+            frame_id,                       // camera_color_optical_frame
+            0.0f, 1.0f, 1.0f,              // cyan
+            handle_id * 10,                 // id_offset: 0 or 10
+            stamp);
+        debug_pubs.camera_pub->publish(ma_cam);
+
+        // Publish link0-frame markers (orange)
+        auto ma_link0 = buildMarkerArray(
+            debug_traj.link0_points,
+            control_frame,                  // NS1_fr3_link0 / NS2_fr3_link0
+            1.0f, 0.5f, 0.0f,              // orange
+            handle_id * 10,
+            stamp);
+        debug_pubs.link0_pub->publish(ma_link0);
+
+        RCLCPP_INFO(node->get_logger(),
+            "[handle %d] Published %zu camera markers on '%s', "
+            "%zu link0 markers on '%s'.",
+            handle_id,
+            debug_traj.camera_points.size(),
+            debug_pubs.camera_pub->get_topic_name(),
+            debug_traj.link0_points.size(),
+            debug_pubs.link0_pub->get_topic_name());
+    }
+
+    // ----------------------------------------------------------
+    // Execute trajectory
+    // ----------------------------------------------------------
     double last_t = 0.0;
 
-    // Process waypoints
     for (const auto &wp : handle["waypoints"])
     {
         if (g_shutdown_requested) break;
 
         // --- Timing ---
-        double t         = wp["t"].get<double>();
+        double t         = wp["t_s"].get<double>();
         double delay_sec = t - last_t;
         last_t           = t;
 
@@ -313,17 +453,17 @@ void publishHandle(
                 std::chrono::nanoseconds(static_cast<int64_t>(delay_sec * 1e9)));
         }
 
-        // Read raw delta from JSON (expressed in frame_id)
+        // Read raw delta from JSON
         geometry_msgs::msg::Vector3 raw_delta_pos;
-        raw_delta_pos.x = wp["position"][0].get<double>();
-        raw_delta_pos.y = wp["position"][1].get<double>();
-        raw_delta_pos.z = wp["position"][2].get<double>();
+        raw_delta_pos.x = wp["cumulative_position"][0].get<double>();
+        raw_delta_pos.y = wp["cumulative_position"][1].get<double>();
+        raw_delta_pos.z = wp["cumulative_position"][2].get<double>();
 
         geometry_msgs::msg::Quaternion raw_delta_ori;
-        raw_delta_ori.w = wp["quaternion_wxyz"][0].get<double>();
-        raw_delta_ori.x = wp["quaternion_wxyz"][1].get<double>();
-        raw_delta_ori.y = wp["quaternion_wxyz"][2].get<double>();
-        raw_delta_ori.z = wp["quaternion_wxyz"][3].get<double>();
+        raw_delta_ori.w = wp["cumulative_quaternion_wxyz"][0].get<double>();
+        raw_delta_ori.x = wp["cumulative_quaternion_wxyz"][1].get<double>();
+        raw_delta_ori.y = wp["cumulative_quaternion_wxyz"][2].get<double>();
+        raw_delta_ori.z = wp["cumulative_quaternion_wxyz"][3].get<double>();
 
         // Rotate delta position into fr3_link0
         geometry_msgs::msg::Point delta_pos_in_link0;
@@ -359,8 +499,12 @@ void publishHandle(
         target_stamped.header.stamp    = node->get_clock()->now();
         target_stamped.pose            = target_pose;
 
-        pub->publish(target_stamped);
-        RCLCPP_INFO(node->get_logger(), "Published target pose at t=%.2f", t);
+        if (!debug_markers) {
+            pub->publish(target_stamped);
+            RCLCPP_INFO(node->get_logger(), "Published target pose at t=%.2f", t);
+        } else {
+            RCLCPP_DEBUG(node->get_logger(), "[DEBUG] Skipping real pose publish at t=%.2f", t);
+        }
     }
 
     RCLCPP_INFO(node->get_logger(), "[handle %d] Done.", handle_id);
@@ -375,6 +519,15 @@ int main(int argc, char **argv)
     auto node = rclcpp::Node::make_shared("franka_cartesian_path_json_dual_increments");
     signal(SIGINT, signalHandler);
 
+    // Debug markers flag  (--ros-args -p debug_markers:=true)
+    node->declare_parameter("debug_markers", false);
+    bool debug_markers = node->get_parameter("debug_markers").as_bool();
+    if (debug_markers)
+        RCLCPP_INFO(node->get_logger(),
+            "Debug markers ENABLED.  "
+            "Subscribe to /debug/handle_<N>/waypoints_camera and "
+            "/debug/handle_<N>/waypoints_link0 in RViz.");
+
     // TF2 buffer + listener
     auto tf_buffer   = std::make_shared<tf2_ros::Buffer>(node->get_clock());
     auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
@@ -382,8 +535,9 @@ int main(int argc, char **argv)
     RCLCPP_INFO(node->get_logger(), "Waiting 2 s for TF to become available...");
     rclcpp::sleep_for(std::chrono::seconds(2));
 
-    // Create one publisher per handle_id / namespace
+    // Create one pose publisher + one debug publisher pair per handle
     std::map<int, rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr> publishers;
+    std::map<int, DebugPublishers> debug_pub_map;
 
     for (const auto &[handle_id, cfg] : HANDLE_CONFIG) {
         std::string topic = cfg.ns + "/my_cartesian_impedance_controller/target_pose";
@@ -392,16 +546,30 @@ int main(int argc, char **argv)
         RCLCPP_INFO(node->get_logger(),
                     "Publisher handle_id %d -> %s  (base frame: %s)",
                     handle_id, topic.c_str(), cfg.base_frame.c_str());
+
+        if (debug_markers) {
+            std::string cam_topic   = "/debug/handle_" + std::to_string(handle_id) + "/waypoints_camera";
+            std::string link0_topic = "/debug/handle_" + std::to_string(handle_id) + "/waypoints_link0";
+            // transient_local = latched: subscribers connecting after publish still receive the message
+            auto qos = rclcpp::QoS(1).transient_local();
+            debug_pub_map[handle_id] = {
+                node->create_publisher<visualization_msgs::msg::MarkerArray>(cam_topic,   qos),
+                node->create_publisher<visualization_msgs::msg::MarkerArray>(link0_topic, qos)
+            };
+        }
     }
 
     // Load JSON
     std::string package_path =
         ament_index_cpp::get_package_share_directory("ignacio_cartesian_pose_json");
 
-    node->declare_parameter("waypoints_file", "waypoints_test_dual_increments_rotation.json");
+    node->declare_parameter("waypoints_file", "action_profiles_displacement.json");
     std::string filename =
         package_path + "/gripper_traj/" +
         node->get_parameter("waypoints_file").as_string();
+
+    RCLCPP_INFO(node->get_logger(), "Loaded waypoints file from: %s", filename.c_str());
+
 
     std::ifstream file(filename);
     if (!file.is_open()) {
@@ -428,13 +596,21 @@ int main(int argc, char **argv)
             continue;
         }
 
+        DebugPublishers dbg_pubs;
+        if (debug_markers) {
+            auto dbg_it = debug_pub_map.find(handle_id);
+            if (dbg_it != debug_pub_map.end())
+                dbg_pubs = dbg_it->second;
+        }
+
         threads.emplace_back(publishHandle,
                              node,
-                             handle,                      // json copied per thread
+                             handle,
                              pub_it->second,
-                             tf_buffer,                   // shared_ptr: thread-safe
-                             cfg_it->second.base_frame,   // "NS1_fr3_link0" or "NS2_fr3_link0"
-                             t0);
+                             tf_buffer,
+                             t0,
+                             debug_markers,
+                             dbg_pubs);
     }
 
     for (auto &t : threads) t.join();
