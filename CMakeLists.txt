@@ -129,4 +129,10 @@ install(DIRECTORY calibration_results/
   DESTINATION share/${PROJECT_NAME}/calibration_results
 )
 
+install(PROGRAMS
+  scripts/wrench_logger_node.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME wrench_logger_node
+)
+
 ament_package()
