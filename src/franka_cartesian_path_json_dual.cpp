@@ -197,7 +197,7 @@ int main(int argc, char **argv)
 
     node->declare_parameter("waypoints_file", "waypoints_test_dual_camera.json");
     std::string filename =
-        package_path + "/gripper_traj/" +
+        package_path + "/test_gripper_traj/" +
         node->get_parameter("waypoints_file").as_string();
 
     std::ifstream file(filename);
