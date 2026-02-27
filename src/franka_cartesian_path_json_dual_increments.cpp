@@ -14,6 +14,13 @@
 #include <thread>
 #include <map>
 
+// For subprocess management
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#include <cerrno>
+#include <cstring>
+
 using json = nlohmann::json;
 
 std::atomic<bool> g_shutdown_requested(false);
@@ -30,7 +37,112 @@ static const std::map<int, HandleConfig> HANDLE_CONFIG = {
     {1, {"/NS2", "NS2_fr3_link0"}},
 };
 
-// ==========================================================
+
+// ===========================================================================
+// Wrench Logger subprocess management
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Launch wrench_logger_node via `ros2 run` as a child process.
+// The workspace must be sourced in the calling environment (standard when
+// launching from a ROS 2 launch file or a sourced terminal).
+//
+// Optional ROS parameters can be forwarded via extra_ros_args, e.g.:
+//   {"save_interval_sec:=10.0", "tf_timeout_sec:=0.1"}
+//
+// Returns the child PID on success, -1 on failure.
+// ---------------------------------------------------------------------------
+pid_t launchWrenchLogger(
+    const rclcpp::Logger              &logger,
+    const std::string                 &package_name    = "ignacio_cartesian_pose_json",
+    const std::string                 &executable_name = "wrench_logger_node",
+    const std::vector<std::string>    &extra_ros_args  = {})
+{
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        RCLCPP_ERROR(logger, "fork() failed when launching wrench logger: %s", strerror(errno));
+        return -1;
+    }
+
+    if (pid == 0)
+    {
+        // ---- CHILD PROCESS ------------------------------------------------
+        // Build argv for:
+        //   ros2 run <package> <executable> [--ros-args [-p key:=val ...]]
+        std::vector<std::string> args_str = {
+            "ros2", "run", package_name, executable_name
+        };
+
+        if (!extra_ros_args.empty()) {
+            args_str.push_back("--ros-args");
+            for (const auto &a : extra_ros_args)
+                args_str.push_back(a);
+        }
+
+        // Convert to char* array required by execvp
+        std::vector<const char *> argv_ptrs;
+        argv_ptrs.reserve(args_str.size() + 1);
+        for (const auto &s : args_str)
+            argv_ptrs.push_back(s.c_str());
+        argv_ptrs.push_back(nullptr);
+
+        execvp("ros2", const_cast<char **>(argv_ptrs.data()));
+
+        // execvp only returns on failure
+        // Use write() instead of RCLCPP_ERROR — rclcpp is not available in child after fork
+        const char *msg = "[wrench_logger child] execvp failed\n";
+        write(STDERR_FILENO, msg, strlen(msg));
+        _exit(1);
+    }
+
+    // ---- PARENT PROCESS ---------------------------------------------------
+    RCLCPP_INFO(logger,
+        "Launched wrench_logger_node via 'ros2 run %s %s' (child PID %d)",
+        package_name.c_str(), executable_name.c_str(), pid);
+
+    return pid;
+}
+
+// ---------------------------------------------------------------------------
+// Gracefully stop the wrench logger child process:
+//   1. Send SIGINT  → triggers Python's _signal_handler → final JSON flush
+//   2. Poll for up to `timeout_ms` milliseconds
+//   3. If still alive after timeout, send SIGKILL
+// ---------------------------------------------------------------------------
+void stopWrenchLogger(pid_t pid, const rclcpp::Logger &logger, int timeout_ms = 3000)
+{
+    if (pid <= 0) return;
+
+    RCLCPP_INFO(logger,
+        "Sending SIGINT to wrench_logger (PID %d) — waiting for final flush...", pid);
+    kill(pid, SIGINT);
+
+    const int poll_interval_ms = 100;
+    int elapsed_ms = 0;
+    int status = 0;
+
+    while (elapsed_ms < timeout_ms) {
+        pid_t result = waitpid(pid, &status, WNOHANG);
+        if (result == pid) {
+            RCLCPP_INFO(logger,
+                "wrench_logger (PID %d) exited cleanly (status %d).", pid, status);
+            return;
+        }
+        rclcpp::sleep_for(std::chrono::milliseconds(poll_interval_ms));
+        elapsed_ms += poll_interval_ms;
+    }
+
+    // Still alive — force kill
+    RCLCPP_WARN(logger,
+        "wrench_logger (PID %d) did not exit within %d ms — sending SIGKILL.", pid, timeout_ms);
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+    RCLCPP_INFO(logger, "wrench_logger (PID %d) force-killed.", pid);
+}
+
+
+// ===========================================================================
 // Debug marker helpers
 //
 // Two topics per handle:
@@ -46,7 +158,7 @@ static const std::map<int, HandleConfig> HANDLE_CONFIG = {
 //   link0   waypoints → orange (1, 0.5, 0)
 //
 // Enable with ROS parameter:  --ros-args -p debug_markers:=true
-// ==========================================================
+// ===========================================================================
 
 // Per-handle debug publisher pair
 struct DebugPublishers {
@@ -100,7 +212,7 @@ visualization_msgs::msg::MarkerArray buildMarkerArray(
     spheres.points       = points;
     ma.markers.push_back(spheres);
 
-    // --- ARROW at first waypoint to show starting point ---
+    // --- Larger SPHERE at first waypoint to show starting point ---
     if (!points.empty()) {
         visualization_msgs::msg::Marker start_sphere;
         start_sphere.header   = line.header;
@@ -119,10 +231,11 @@ visualization_msgs::msg::MarkerArray buildMarkerArray(
     return ma;
 }
 
-// ==========================================================
+
+// ===========================================================================
 // Look up the current pose of source_frame expressed in
 // target_frame via TF. Retries up to max_attempts times.
-// ==========================================================
+// ===========================================================================
 bool getCurrentPose(
     const std::string               &source_frame,
     const std::string               &target_frame,
@@ -170,27 +283,20 @@ bool getCurrentPose(
     return false;
 }
 
-// ==========================================================
+
+// ===========================================================================
 // Apply a delta pose on top of a base pose, both in fr3_link0.
 //
 // POSITION:
 //   result.position = base.position + delta.position
 //   The delta is added directly because the caller already rotated
 //   it from the source frame into fr3_link0 (world frame).
-//   No additional rotation by q_base is needed here.
 //
 // ORIENTATION:
 //   result.orientation = q_delta * q_base   (pre-multiplication)
 //   Pre-multiplying applies the delta rotation in the WORLD frame
 //   (fr3_link0), meaning the rotation axis is fixed in space.
-//   This is correct because the caller already re-expressed the
-//   delta axis from the source frame into fr3_link0 via the
-//   similarity transform (see rotateDeltaOrientation).
-//
-//   If you post-multiply (q_base * q_delta) instead, the rotation
-//   is applied in the END-EFFECTOR LOCAL frame, which would ignore
-//   the frame_id entirely and always rotate around the EEF axes.
-// ==========================================================
+// ===========================================================================
 geometry_msgs::msg::Pose applyDeltaPose(
     const geometry_msgs::msg::Pose &base,
     const geometry_msgs::msg::Pose &delta,
@@ -230,10 +336,11 @@ geometry_msgs::msg::Pose applyDeltaPose(
     return result;
 }
 
-// ==========================================================
+
+// ===========================================================================
 // Rotate a displacement vector from source_frame into target_frame,
 // applying ROTATION ONLY (no translation/origin offset).
-// ==========================================================
+// ===========================================================================
 bool rotateDeltaPosition(
     const geometry_msgs::msg::Vector3 &delta_in,
     const std::string                 &source_frame,
@@ -269,11 +376,12 @@ bool rotateDeltaPosition(
     }
 }
 
-// ==========================================================
+
+// ===========================================================================
 // Re-express a delta quaternion from source_frame into target_frame
 // using the SIMILARITY TRANSFORM:
 //   q_out = q_rot * q_delta * q_rot^{-1}
-// ==========================================================
+// ===========================================================================
 bool rotateDeltaOrientation(
     const geometry_msgs::msg::Quaternion &q_delta_in,
     const std::string                    &source_frame,
@@ -322,9 +430,9 @@ bool rotateDeltaOrientation(
 }
 
 
-// ==========================================================
+// ===========================================================================
 // Per-handle publishing thread
-// ==========================================================
+// ===========================================================================
 void publishHandle(
     rclcpp::Node::SharedPtr node,
     const json handle,
@@ -336,7 +444,7 @@ void publishHandle(
 {
     int handle_id = handle["handle_id"].get<int>();
 
-    std::string frame_id = "camera_color_optical_frame";  // default if not specified in JSON
+    std::string frame_id = "camera_color_optical_frame";  // default if not in JSON
     if (handle.contains("frame_id"))
         frame_id = handle["frame_id"].get<std::string>();
 
@@ -367,22 +475,14 @@ void publishHandle(
 
         for (const auto &wp : handle["waypoints"])
         {
-            // --- Camera-frame point (raw cumulative_position) ---
-            // cumulative_position is a displacement from the start, so
-            // we visualise it offset from the starting TCP position
-            // expressed in the camera frame.  We look up start_pose in
-            // camera frame for a meaningful origin.
+            // Camera-frame point (raw cumulative_position)
             geometry_msgs::msg::Point cam_pt;
-
-            // The raw delta is already in camera frame; use it directly
-            // relative to zero (the camera frame origin) so the shape is
-            // visible without needing the TCP camera-frame position.
             cam_pt.x = wp["cumulative_position"][0].get<double>();
             cam_pt.y = wp["cumulative_position"][1].get<double>();
             cam_pt.z = wp["cumulative_position"][2].get<double>();
             debug_traj.camera_points.push_back(cam_pt);
 
-            // --- Link0-frame point (start_pose + rotated delta) ---
+            // Link0-frame point (start_pose + rotated delta)
             geometry_msgs::msg::Vector3 raw_delta_pos;
             raw_delta_pos.x = wp["cumulative_position"][0].get<double>();
             raw_delta_pos.y = wp["cumulative_position"][1].get<double>();
@@ -409,16 +509,16 @@ void publishHandle(
         auto stamp = node->get_clock()->now();
         auto ma_cam = buildMarkerArray(
             debug_traj.camera_points,
-            frame_id,                       // camera_color_optical_frame
+            frame_id,
             0.0f, 1.0f, 1.0f,              // cyan
-            handle_id * 10,                 // id_offset: 0 or 10
+            handle_id * 10,
             stamp);
         debug_pubs.camera_pub->publish(ma_cam);
 
         // Publish link0-frame markers (orange)
         auto ma_link0 = buildMarkerArray(
             debug_traj.link0_points,
-            control_frame,                  // NS1_fr3_link0 / NS2_fr3_link0
+            control_frame,
             1.0f, 0.5f, 0.0f,              // orange
             handle_id * 10,
             stamp);
@@ -443,7 +543,7 @@ void publishHandle(
     {
         if (g_shutdown_requested) break;
 
-        // --- Timing ---
+        // Timing
         double t         = wp["t_s"].get<double>();
         double delay_sec = t - last_t;
         last_t           = t;
@@ -467,8 +567,8 @@ void publishHandle(
 
         // Rotate delta position into fr3_link0
         geometry_msgs::msg::Point delta_pos_in_link0;
-        if (!rotateDeltaPosition(raw_delta_pos, frame_id, control_frame, delta_pos_in_link0, *tf_buffer,
-                                 node->get_clock(), node->get_logger()))
+        if (!rotateDeltaPosition(raw_delta_pos, frame_id, control_frame, delta_pos_in_link0,
+                                 *tf_buffer, node->get_clock(), node->get_logger()))
         {
             RCLCPP_ERROR(node->get_logger(),
                 "Aborting: could not rotate delta position at t=%.2f", t);
@@ -477,15 +577,15 @@ void publishHandle(
 
         // Re-express delta orientation into fr3_link0
         geometry_msgs::msg::Quaternion delta_ori_in_link0;
-        if (!rotateDeltaOrientation(raw_delta_ori, frame_id, control_frame, delta_ori_in_link0, *tf_buffer,
-                                    node->get_logger()))
+        if (!rotateDeltaOrientation(raw_delta_ori, frame_id, control_frame, delta_ori_in_link0,
+                                    *tf_buffer, node->get_logger()))
         {
             RCLCPP_ERROR(node->get_logger(),
                 "Aborting: could not rotate delta orientation at t=%.2f", t);
             return;
         }
 
-        // Apply delta pose on top of the starting TCP pose
+        // Apply delta on top of starting TCP pose
         geometry_msgs::msg::Pose delta_in_link0;
         delta_in_link0.position    = delta_pos_in_link0;
         delta_in_link0.orientation = delta_ori_in_link0;
@@ -510,14 +610,19 @@ void publishHandle(
     RCLCPP_INFO(node->get_logger(), "[handle %d] Done.", handle_id);
 }
 
-// ==========================================================
+
+// ===========================================================================
 // MAIN
-// ==========================================================
+// ===========================================================================
 int main(int argc, char **argv)
 {
     rclcpp::init(argc, argv);
     auto node = rclcpp::Node::make_shared("franka_cartesian_path_json_dual_increments");
     signal(SIGINT, signalHandler);
+
+    // ------------------------------------------------------------------
+    // Parameters
+    // ------------------------------------------------------------------
 
     // Debug markers flag  (--ros-args -p debug_markers:=true)
     node->declare_parameter("debug_markers", false);
@@ -528,14 +633,37 @@ int main(int argc, char **argv)
             "Subscribe to /debug/handle_<N>/waypoints_camera and "
             "/debug/handle_<N>/waypoints_link0 in RViz.");
 
+    node->declare_parameter("record_wrench", false);
+    bool record_wrench = node->get_parameter("record_wrench").as_bool();
+
+    pid_t recorder_pid = -1;
+    if (record_wrench) {
+        recorder_pid = launchWrenchLogger(
+            node->get_logger(),
+            "ignacio_cartesian_pose_json",
+            "wrench_logger_node",
+            {});  // uses wrench_logger defaults for save_interval and tf_timeout
+        if (recorder_pid > 0) {
+            RCLCPP_INFO(node->get_logger(),
+                "Waiting 1 s for wrench_logger to initialise...");
+            rclcpp::sleep_for(std::chrono::seconds(1));
+        }
+    } else {
+        RCLCPP_INFO(node->get_logger(), "Wrench recording disabled.");
+    }
+
+    // ------------------------------------------------------------------
     // TF2 buffer + listener
+    // ------------------------------------------------------------------
     auto tf_buffer   = std::make_shared<tf2_ros::Buffer>(node->get_clock());
     auto tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
 
     RCLCPP_INFO(node->get_logger(), "Waiting 2 s for TF to become available...");
     rclcpp::sleep_for(std::chrono::seconds(2));
 
+    // ------------------------------------------------------------------
     // Create one pose publisher + one debug publisher pair per handle
+    // ------------------------------------------------------------------
     std::map<int, rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr> publishers;
     std::map<int, DebugPublishers> debug_pub_map;
 
@@ -550,7 +678,7 @@ int main(int argc, char **argv)
         if (debug_markers) {
             std::string cam_topic   = "/debug/handle_" + std::to_string(handle_id) + "/waypoints_camera";
             std::string link0_topic = "/debug/handle_" + std::to_string(handle_id) + "/waypoints_link0";
-            // transient_local = latched: subscribers connecting after publish still receive the message
+            // transient_local = latched: late subscribers still receive the message
             auto qos = rclcpp::QoS(1).transient_local();
             debug_pub_map[handle_id] = {
                 node->create_publisher<visualization_msgs::msg::MarkerArray>(cam_topic,   qos),
@@ -559,7 +687,9 @@ int main(int argc, char **argv)
         }
     }
 
-    // Load JSON
+    // ------------------------------------------------------------------
+    // Load JSON waypoints file
+    // ------------------------------------------------------------------
     std::string package_path =
         ament_index_cpp::get_package_share_directory("ignacio_cartesian_pose_json");
 
@@ -568,18 +698,20 @@ int main(int argc, char **argv)
         package_path + "/gripper_traj/" +
         node->get_parameter("waypoints_file").as_string();
 
-    RCLCPP_INFO(node->get_logger(), "Loaded waypoints file from: %s", filename.c_str());
-
+    RCLCPP_INFO(node->get_logger(), "Loading waypoints from: %s", filename.c_str());
 
     std::ifstream file(filename);
     if (!file.is_open()) {
         RCLCPP_ERROR(node->get_logger(), "Cannot open JSON file: %s", filename.c_str());
+        stopWrenchLogger(recorder_pid, node->get_logger());
         return 1;
     }
     json j;
     file >> j;
 
-    // Spawn one thread per handle
+    // ------------------------------------------------------------------
+    // Spawn one thread per handle and execute the trajectory
+    // ------------------------------------------------------------------
     const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::thread> threads;
 
@@ -616,6 +748,13 @@ int main(int argc, char **argv)
     for (auto &t : threads) t.join();
 
     RCLCPP_INFO(node->get_logger(), "All handles processed.");
+
+    // ------------------------------------------------------------------
+    // Trajectory is complete — stop the wrench logger so it flushes its
+    // final JSON before this process exits.
+    // ------------------------------------------------------------------
+    stopWrenchLogger(recorder_pid, node->get_logger());
+
     rclcpp::shutdown();
     return 0;
 }
