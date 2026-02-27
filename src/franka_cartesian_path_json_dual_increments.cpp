@@ -2,8 +2,10 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include <std_msgs/msg/string.hpp>                      // ← NEW: for run_folder topic
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include <filesystem>                                    // ← NEW: for path manipulation
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -13,6 +15,8 @@
 #include <signal.h>
 #include <thread>
 #include <map>
+#include <chrono>                                        // ← NEW: for timestamp
+#include <ctime>                                         // ← NEW: for localtime_r
 
 // For subprocess management
 #include <sys/types.h>
@@ -22,6 +26,7 @@
 #include <cstring>
 
 using json = nlohmann::json;
+namespace fs = std::filesystem;                          // ← NEW
 
 std::atomic<bool> g_shutdown_requested(false);
 void signalHandler(int) { g_shutdown_requested = true; }
@@ -39,29 +44,71 @@ static const std::map<int, HandleConfig> HANDLE_CONFIG = {
 
 
 // ===========================================================================
+// Run-folder creation
+//
+// Derives the run folder from the waypoints file path:
+//   waypoints = /experiments/test1/action_profiles_displacement.json
+//   records   = /experiments/test1/records
+//   run_dir   = /experiments/test1/records/20260227_160837/
+//       wrench/
+//       obs/
+//       realsense/
+// ===========================================================================
+std::string createRunFolder(const std::string &waypoints_abs, const rclcpp::Logger &logger)
+{
+    fs::path parent = fs::path(waypoints_abs).parent_path();
+    fs::path records_root = parent / "records";
+
+    auto now = std::chrono::system_clock::now();
+    std::time_t tt = std::chrono::system_clock::to_time_t(now);
+    std::tm tm_local{};
+    localtime_r(&tt, &tm_local);
+    char ts[32];
+    std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_local);
+
+    fs::path run_dir = records_root / ts;
+
+    try {
+        fs::create_directories(run_dir / "wrench");
+        fs::create_directories(run_dir / "obs");
+        fs::create_directories(run_dir / "realsense");
+    } catch (const std::exception &e) {
+        RCLCPP_ERROR(logger, "Failed to create run folder '%s': %s",
+                     run_dir.string().c_str(), e.what());
+        return "";
+    }
+
+    RCLCPP_INFO(logger, "Run folder created: %s", run_dir.string().c_str());
+    RCLCPP_INFO(logger, "  Subfolders: wrench/  obs/  realsense/");
+    return run_dir.string();
+}
+
+
+// ===========================================================================
 // Wrench Logger subprocess management
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// Launch wrench_logger_node via `ros2 run` as a child process.
+// Launch a ROS 2 node via `ros2 run` as a child process.
 // The workspace must be sourced in the calling environment (standard when
 // launching from a ROS 2 launch file or a sourced terminal).
 //
 // Optional ROS parameters can be forwarded via extra_ros_args, e.g.:
-//   {"save_interval_sec:=10.0", "tf_timeout_sec:=0.1"}
+//   {"-p", "save_interval_sec:=10.0", "-p", "tf_timeout_sec:=0.1"}
 //
 // Returns the child PID on success, -1 on failure.
 // ---------------------------------------------------------------------------
-pid_t launchWrenchLogger(
+pid_t launchROSNode(
     const rclcpp::Logger              &logger,
-    const std::string                 &package_name    = "ignacio_cartesian_pose_json",
-    const std::string                 &executable_name = "wrench_logger_node",
-    const std::vector<std::string>    &extra_ros_args  = {})
+    const std::string                 &package_name,
+    const std::string                 &executable_name,
+    const std::vector<std::string>    &extra_ros_args = {})
 {
     pid_t pid = fork();
 
     if (pid < 0) {
-        RCLCPP_ERROR(logger, "fork() failed when launching wrench logger: %s", strerror(errno));
+        RCLCPP_ERROR(logger, "fork() failed when launching %s %s: %s",
+                     package_name.c_str(), executable_name.c_str(), strerror(errno));
         return -1;
     }
 
@@ -91,31 +138,32 @@ pid_t launchWrenchLogger(
 
         // execvp only returns on failure
         // Use write() instead of RCLCPP_ERROR — rclcpp is not available in child after fork
-        const char *msg = "[wrench_logger child] execvp failed\n";
+        const char *msg = "[launchROSNode child] execvp failed\n";
         write(STDERR_FILENO, msg, strlen(msg));
         _exit(1);
     }
 
     // ---- PARENT PROCESS ---------------------------------------------------
     RCLCPP_INFO(logger,
-        "Launched wrench_logger_node via 'ros2 run %s %s' (child PID %d)",
+        "Launched %s %s via 'ros2 run' (child PID %d)",
         package_name.c_str(), executable_name.c_str(), pid);
 
     return pid;
 }
 
 // ---------------------------------------------------------------------------
-// Gracefully stop the wrench logger child process:
-//   1. Send SIGINT  → triggers Python's _signal_handler → final JSON flush
+// Gracefully stop a child process:
+//   1. Send SIGINT  → triggers signal handler → allows for cleanup/flush
 //   2. Poll for up to `timeout_ms` milliseconds
 //   3. If still alive after timeout, send SIGKILL
 // ---------------------------------------------------------------------------
-void stopWrenchLogger(pid_t pid, const rclcpp::Logger &logger, int timeout_ms = 3000)
+void stopChildProcess(pid_t pid, const rclcpp::Logger &logger, const std::string &name = "", int timeout_ms = 3000)
 {
     if (pid <= 0) return;
 
+    std::string name_str = !name.empty() ? name : std::to_string(pid);
     RCLCPP_INFO(logger,
-        "Sending SIGINT to wrench_logger (PID %d) — waiting for final flush...", pid);
+        "Sending SIGINT to %s (PID %d) — waiting for cleanup...", name_str.c_str(), pid);
     kill(pid, SIGINT);
 
     const int poll_interval_ms = 100;
@@ -126,7 +174,7 @@ void stopWrenchLogger(pid_t pid, const rclcpp::Logger &logger, int timeout_ms = 
         pid_t result = waitpid(pid, &status, WNOHANG);
         if (result == pid) {
             RCLCPP_INFO(logger,
-                "wrench_logger (PID %d) exited cleanly (status %d).", pid, status);
+                "%s (PID %d) exited cleanly (status %d).", name_str.c_str(), pid, status);
             return;
         }
         rclcpp::sleep_for(std::chrono::milliseconds(poll_interval_ms));
@@ -135,10 +183,10 @@ void stopWrenchLogger(pid_t pid, const rclcpp::Logger &logger, int timeout_ms = 
 
     // Still alive — force kill
     RCLCPP_WARN(logger,
-        "wrench_logger (PID %d) did not exit within %d ms — sending SIGKILL.", pid, timeout_ms);
+        "%s (PID %d) did not exit within %d ms — sending SIGKILL.", name_str.c_str(), pid, timeout_ms);
     kill(pid, SIGKILL);
     waitpid(pid, &status, 0);
-    RCLCPP_INFO(logger, "wrench_logger (PID %d) force-killed.", pid);
+    RCLCPP_INFO(logger, "%s (PID %d) force-killed.", name_str.c_str(), pid);
 }
 
 
@@ -214,18 +262,18 @@ visualization_msgs::msg::MarkerArray buildMarkerArray(
 
     // --- Larger SPHERE at first waypoint to show starting point ---
     if (!points.empty()) {
-        visualization_msgs::msg::Marker start_sphere;
-        start_sphere.header   = line.header;
-        start_sphere.ns       = "start";
-        start_sphere.id       = id_offset + 2;
-        start_sphere.type     = visualization_msgs::msg::Marker::SPHERE;
-        start_sphere.action   = visualization_msgs::msg::Marker::ADD;
-        start_sphere.pose.position = points.front();
-        start_sphere.pose.orientation.w = 1.0;
-        start_sphere.scale.x = start_sphere.scale.y = start_sphere.scale.z = 0.016;
-        start_sphere.color.r = 1.0f; start_sphere.color.g = 1.0f;
+    visualization_msgs::msg::Marker start_sphere;
+    start_sphere.header             = line.header;
+    start_sphere.ns                 = "start";
+    start_sphere.id                 = id_offset + 2;
+    start_sphere.type               = visualization_msgs::msg::Marker::SPHERE;
+    start_sphere.action             = visualization_msgs::msg::Marker::ADD;
+    start_sphere.pose.position      = points.front();
+    start_sphere.pose.orientation.w = 1.0;
+    start_sphere.scale.x = start_sphere.scale.y = start_sphere.scale.z = 0.016;
+    start_sphere.color.r = 1.0f; start_sphere.color.g = 1.0f;
         start_sphere.color.b = 0.0f; start_sphere.color.a = 1.0f;  // yellow = start
-        ma.markers.push_back(start_sphere);
+    ma.markers.push_back(start_sphere);
     }
 
     return ma;
@@ -439,7 +487,7 @@ void publishHandle(
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub,
     std::shared_ptr<tf2_ros::Buffer> tf_buffer,
     const std::chrono::steady_clock::time_point t0,
-    bool debug_markers,
+    bool debug,
     DebugPublishers debug_pubs)
 {
     int handle_id = handle["handle_id"].get<int>();
@@ -448,95 +496,82 @@ void publishHandle(
     if (handle.contains("frame_id"))
         frame_id = handle["frame_id"].get<std::string>();
 
-    // ----------------------------------------------------------
-    // Capture the starting TCP pose in the specific control frame
-    // ----------------------------------------------------------
-    geometry_msgs::msg::PoseStamped start_pose_in_link0;
-    std::string tcp_frame     = (handle_id == 0) ? "NS1_fr3_hand_tcp"  : "NS2_fr3_hand_tcp";
-    std::string control_frame = (handle_id == 0) ? "NS1_fr3_link0"     : "NS2_fr3_link0";
+    std::string tcp_frame     = (handle_id == 0) ? "NS1_fr3_hand_tcp" : "NS2_fr3_hand_tcp";
+    std::string control_frame = (handle_id == 0) ? "NS1_fr3_link0"    : "NS2_fr3_link0";
 
+    geometry_msgs::msg::PoseStamped start_pose_in_link0;
     if (!getCurrentPose(tcp_frame, control_frame, start_pose_in_link0, *tf_buffer, node->get_logger()))
     {
         RCLCPP_ERROR(node->get_logger(),
-            "Could not read current TCP pose in %s. Aborting.", control_frame.c_str());
+            "Could not read current TCP pose in %s. Aborting handle %d.",
+            control_frame.c_str(), handle_id);
         return;
     }
 
-    // ----------------------------------------------------------
-    // Debug: pre-collect all waypoints into marker arrays so they
-    // are published as complete trajectories before execution starts.
-    // ----------------------------------------------------------
+    RCLCPP_INFO(node->get_logger(),
+        "[handle %d] Pre-computing trajectory markers...", handle_id);
+
     DebugTrajectory debug_traj;
 
-    if (debug_markers)
+    for (const auto &wp : handle["waypoints"])
     {
-        RCLCPP_INFO(node->get_logger(),
-            "[handle %d] Debug mode: pre-computing marker trajectories...", handle_id);
+        if (g_shutdown_requested) break;
 
-        for (const auto &wp : handle["waypoints"])
-        {
             // Camera-frame point (raw cumulative_position)
-            geometry_msgs::msg::Point cam_pt;
-            cam_pt.x = wp["cumulative_position"][0].get<double>();
-            cam_pt.y = wp["cumulative_position"][1].get<double>();
-            cam_pt.z = wp["cumulative_position"][2].get<double>();
-            debug_traj.camera_points.push_back(cam_pt);
+        geometry_msgs::msg::Point cam_pt;
+        cam_pt.x = wp["cumulative_position"][0].get<double>();
+        cam_pt.y = wp["cumulative_position"][1].get<double>();
+        cam_pt.z = wp["cumulative_position"][2].get<double>();
+        debug_traj.camera_points.push_back(cam_pt);
 
             // Link0-frame point (start_pose + rotated delta)
-            geometry_msgs::msg::Vector3 raw_delta_pos;
-            raw_delta_pos.x = wp["cumulative_position"][0].get<double>();
-            raw_delta_pos.y = wp["cumulative_position"][1].get<double>();
-            raw_delta_pos.z = wp["cumulative_position"][2].get<double>();
+        geometry_msgs::msg::Vector3 raw_delta_pos;
+        raw_delta_pos.x = wp["cumulative_position"][0].get<double>();
+        raw_delta_pos.y = wp["cumulative_position"][1].get<double>();
+        raw_delta_pos.z = wp["cumulative_position"][2].get<double>();
 
-            geometry_msgs::msg::Point delta_in_link0;
-            if (!rotateDeltaPosition(raw_delta_pos, frame_id, control_frame,
-                                     delta_in_link0, *tf_buffer,
-                                     node->get_clock(), node->get_logger()))
-            {
-                RCLCPP_WARN(node->get_logger(),
-                    "[handle %d] Debug: could not rotate waypoint for marker, skipping.", handle_id);
-                continue;
-            }
-
-            geometry_msgs::msg::Point link0_pt;
-            link0_pt.x = start_pose_in_link0.pose.position.x + delta_in_link0.x;
-            link0_pt.y = start_pose_in_link0.pose.position.y + delta_in_link0.y;
-            link0_pt.z = start_pose_in_link0.pose.position.z + delta_in_link0.z;
-            debug_traj.link0_points.push_back(link0_pt);
+        geometry_msgs::msg::Point delta_in_link0;
+        if (!rotateDeltaPosition(raw_delta_pos, frame_id, control_frame,
+                                 delta_in_link0, *tf_buffer,
+                                 node->get_clock(), node->get_logger()))
+        {
+            RCLCPP_WARN(node->get_logger(),
+                "[handle %d] Could not rotate waypoint for marker, skipping.", handle_id);
+            continue;
         }
 
-        // Publish camera-frame markers (cyan)
-        auto stamp = node->get_clock()->now();
-        auto ma_cam = buildMarkerArray(
-            debug_traj.camera_points,
-            frame_id,
-            0.0f, 1.0f, 1.0f,              // cyan
-            handle_id * 10,
-            stamp);
-        debug_pubs.camera_pub->publish(ma_cam);
-
-        // Publish link0-frame markers (orange)
-        auto ma_link0 = buildMarkerArray(
-            debug_traj.link0_points,
-            control_frame,
-            1.0f, 0.5f, 0.0f,              // orange
-            handle_id * 10,
-            stamp);
-        debug_pubs.link0_pub->publish(ma_link0);
-
-        RCLCPP_INFO(node->get_logger(),
-            "[handle %d] Published %zu camera markers on '%s', "
-            "%zu link0 markers on '%s'.",
-            handle_id,
-            debug_traj.camera_points.size(),
-            debug_pubs.camera_pub->get_topic_name(),
-            debug_traj.link0_points.size(),
-            debug_pubs.link0_pub->get_topic_name());
+        geometry_msgs::msg::Point link0_pt;
+        link0_pt.x = start_pose_in_link0.pose.position.x + delta_in_link0.x;
+        link0_pt.y = start_pose_in_link0.pose.position.y + delta_in_link0.y;
+        link0_pt.z = start_pose_in_link0.pose.position.z + delta_in_link0.z;
+        debug_traj.link0_points.push_back(link0_pt);
     }
 
-    // ----------------------------------------------------------
-    // Execute trajectory
-    // ----------------------------------------------------------
+        // Publish camera-frame markers (cyan)
+    auto stamp = node->get_clock()->now();
+    debug_pubs.camera_pub->publish(buildMarkerArray(
+        debug_traj.camera_points, frame_id,
+        0.0f, 1.0f, 1.0f, handle_id * 10, stamp));
+
+    debug_pubs.link0_pub->publish(buildMarkerArray(
+        debug_traj.link0_points, control_frame,
+        1.0f, 0.5f, 0.0f, handle_id * 10, stamp));
+
+    RCLCPP_INFO(node->get_logger(),
+        "[handle %d] Markers published — %zu camera pts, %zu link0 pts.",
+        handle_id,
+        debug_traj.camera_points.size(),
+        debug_traj.link0_points.size());
+
+    if (debug) {
+        RCLCPP_WARN(node->get_logger(),
+            "[handle %d] debug=true — trajectory execution SKIPPED. "
+            "Re-run with debug:=false to execute.", handle_id);
+        return;
+    }
+
+    RCLCPP_INFO(node->get_logger(), "[handle %d] Executing trajectory...", handle_id);
+
     double last_t = 0.0;
 
     for (const auto &wp : handle["waypoints"])
@@ -599,12 +634,8 @@ void publishHandle(
         target_stamped.header.stamp    = node->get_clock()->now();
         target_stamped.pose            = target_pose;
 
-        if (!debug_markers) {
-            pub->publish(target_stamped);
-            RCLCPP_INFO(node->get_logger(), "Published target pose at t=%.2f", t);
-        } else {
-            RCLCPP_DEBUG(node->get_logger(), "[DEBUG] Skipping real pose publish at t=%.2f", t);
-        }
+        pub->publish(target_stamped);
+        RCLCPP_INFO(node->get_logger(), "[handle %d] Published target pose at t=%.2f", handle_id, t);
     }
 
     RCLCPP_INFO(node->get_logger(), "[handle %d] Done.", handle_id);
@@ -623,33 +654,115 @@ int main(int argc, char **argv)
     // ------------------------------------------------------------------
     // Parameters
     // ------------------------------------------------------------------
+    node->declare_parameter("debug", false);
+    bool debug = node->get_parameter("debug").as_bool();
 
-    // Debug markers flag  (--ros-args -p debug_markers:=true)
-    node->declare_parameter("debug_markers", false);
-    bool debug_markers = node->get_parameter("debug_markers").as_bool();
-    if (debug_markers)
+    if (debug)
+        RCLCPP_WARN(node->get_logger(),
+            "debug=true — markers will be published but the robot will NOT move. "
+            "Subscribe to /debug/handle_<N>/waypoints_camera and "
+            "/debug/handle_<N>/waypoints_link0 in RViz.");
+    else
         RCLCPP_INFO(node->get_logger(),
-            "Debug markers ENABLED.  "
+            "debug=false — markers will be published and trajectory will execute. "
             "Subscribe to /debug/handle_<N>/waypoints_camera and "
             "/debug/handle_<N>/waypoints_link0 in RViz.");
 
-    node->declare_parameter("record_wrench", false);
-    bool record_wrench = node->get_parameter("record_wrench").as_bool();
+    node->declare_parameter("enable_recording", false);
+    bool enable_recording = node->get_parameter("enable_recording").as_bool();
 
-    pid_t recorder_pid = -1;
-    if (record_wrench) {
-        recorder_pid = launchWrenchLogger(
+    // ------------------------------------------------------------------
+    // NEW: Resolve waypoints file to an absolute path
+    //
+    // Accepts either:
+    //   absolute path  →  used directly   e.g. /home/.../experiments/test1/action_profiles.json
+    //   relative path  →  resolved relative to package share directory
+    // ------------------------------------------------------------------
+    node->declare_parameter("waypoints_file", "action_profiles_displacement.json");
+    std::string waypoints_param = node->get_parameter("waypoints_file").as_string();
+
+    std::string waypoints_abs;
+    if (!waypoints_param.empty() && waypoints_param[0] == '/') {
+        waypoints_abs = waypoints_param;
+    } else {
+        std::string pkg = ament_index_cpp::get_package_share_directory(
+            "ignacio_cartesian_pose_json");
+        waypoints_abs = pkg + "/" + waypoints_param;
+    }
+    RCLCPP_INFO(node->get_logger(), "Loading waypoints from: %s", waypoints_abs.c_str());
+
+    // ------------------------------------------------------------------
+    // Launch recording pipeline: obs_recorder, realsense_recorder, and manager
+    // Only create timestamped folder if recording is enabled
+    // ------------------------------------------------------------------
+    std::vector<pid_t> recorder_pids;  // obs + realsense
+    pid_t manager_pid = -1;
+    if (enable_recording && !debug) {
+        RCLCPP_INFO(node->get_logger(), "Starting recording pipeline...");
+
+        // Create timestamped run folder next to the waypoints file
+        // and publish it so Python recorder nodes know where to save
+        std::string run_folder = createRunFolder(waypoints_abs, node->get_logger());
+        if (run_folder.empty()) {
+            rclcpp::shutdown();
+            return 1;
+        }
+
+        // Transient-local (latched) — nodes that start after this still receive it
+        auto run_folder_pub = node->create_publisher<std_msgs::msg::String>(
+            "/recording_manager/run_folder",
+            rclcpp::QoS(1).transient_local());
+
+        std_msgs::msg::String rf_msg;
+        rf_msg.data = run_folder;
+        run_folder_pub->publish(rf_msg);
+        RCLCPP_INFO(node->get_logger(),
+            "Published run folder on /recording_manager/run_folder: %s", run_folder.c_str());
+
+        // Brief pause so Python nodes can receive the latched message
+        rclcpp::sleep_for(std::chrono::milliseconds(500));
+
+        // Launch obs_recorder_node with its save dir pre-set and auto_record on
+        pid_t obs_pid = launchROSNode(
             node->get_logger(),
             "ignacio_cartesian_pose_json",
-            "wrench_logger_node",
-            {});  // uses wrench_logger defaults for save_interval and tf_timeout
-        if (recorder_pid > 0) {
-            RCLCPP_INFO(node->get_logger(),
-                "Waiting 1 s for wrench_logger to initialise...");
-            rclcpp::sleep_for(std::chrono::seconds(1));
-        }
+            "obs_recorder_node",
+            {"-p", std::string("data_dir:=") + run_folder + "/obs",
+             "-p", "auto_record:=true"});
+        if (obs_pid > 0) recorder_pids.push_back(obs_pid);
+
+        rclcpp::sleep_for(std::chrono::milliseconds(500));
+
+        // Launch realsense_recorder_node with its save dir pre-set and auto_record on
+        pid_t realsense_pid = launchROSNode(
+            node->get_logger(),
+            "ignacio_cartesian_pose_json",
+            "realsense_recorder_node",
+            {"-p", std::string("data_dir:=") + run_folder + "/realsense",
+             "-p", "auto_record:=true"});
+        if (realsense_pid > 0) recorder_pids.push_back(realsense_pid);
+
+        rclcpp::sleep_for(std::chrono::milliseconds(500));
+
+        // Launch recording_manager_node with auto_record enabled.
+        // Stopped FIRST during shutdown so it can gracefully stop obs/realsense
+        // via services, copy the OBS file, then exit before we kill the others.
+        manager_pid = launchROSNode(
+            node->get_logger(),
+            "ignacio_cartesian_pose_json",
+            "recording_manager_node",
+            {"-p", "auto_record:=true"});
+        // manager_pid intentionally not pushed into recorder_pids here;
+        // it is stored separately and stopped before the rest.
+
+        RCLCPP_INFO(node->get_logger(),
+            "Recording pipeline started (%zu processes). Waiting for initialization...",
+            recorder_pids.size());
+        rclcpp::sleep_for(std::chrono::seconds(2));
+    } else if (enable_recording && debug) {
+        RCLCPP_WARN(node->get_logger(), "Recording pipeline disabled because debug=true.");
     } else {
-        RCLCPP_INFO(node->get_logger(), "Wrench recording disabled.");
+        RCLCPP_INFO(node->get_logger(), "Recording pipeline disabled.");
     }
 
     // ------------------------------------------------------------------
@@ -672,38 +785,28 @@ int main(int argc, char **argv)
         publishers[handle_id] =
             node->create_publisher<geometry_msgs::msg::PoseStamped>(topic, 10);
         RCLCPP_INFO(node->get_logger(),
-                    "Publisher handle_id %d -> %s  (base frame: %s)",
-                    handle_id, topic.c_str(), cfg.base_frame.c_str());
+            "Publisher handle_id %d -> %s  (base frame: %s)",
+            handle_id, topic.c_str(), cfg.base_frame.c_str());
 
-        if (debug_markers) {
-            std::string cam_topic   = "/debug/handle_" + std::to_string(handle_id) + "/waypoints_camera";
-            std::string link0_topic = "/debug/handle_" + std::to_string(handle_id) + "/waypoints_link0";
+        std::string cam_topic   = "/debug/handle_" + std::to_string(handle_id) + "/waypoints_camera";
+        std::string link0_topic = "/debug/handle_" + std::to_string(handle_id) + "/waypoints_link0";
             // transient_local = latched: late subscribers still receive the message
-            auto qos = rclcpp::QoS(1).transient_local();
-            debug_pub_map[handle_id] = {
-                node->create_publisher<visualization_msgs::msg::MarkerArray>(cam_topic,   qos),
-                node->create_publisher<visualization_msgs::msg::MarkerArray>(link0_topic, qos)
-            };
-        }
+            // depth=10 ensures RViz can retrieve markers even after toggling display
+        auto qos = rclcpp::QoS(10).transient_local();
+        debug_pub_map[handle_id] = {
+            node->create_publisher<visualization_msgs::msg::MarkerArray>(cam_topic,   qos),
+            node->create_publisher<visualization_msgs::msg::MarkerArray>(link0_topic, qos)
+        };
     }
 
     // ------------------------------------------------------------------
     // Load JSON waypoints file
     // ------------------------------------------------------------------
-    std::string package_path =
-        ament_index_cpp::get_package_share_directory("ignacio_cartesian_pose_json");
-
-    node->declare_parameter("waypoints_file", "action_profiles_displacement.json");
-    std::string filename =
-        package_path + "/gripper_traj/" +
-        node->get_parameter("waypoints_file").as_string();
-
-    RCLCPP_INFO(node->get_logger(), "Loading waypoints from: %s", filename.c_str());
-
-    std::ifstream file(filename);
+    std::ifstream file(waypoints_abs);
     if (!file.is_open()) {
-        RCLCPP_ERROR(node->get_logger(), "Cannot open JSON file: %s", filename.c_str());
-        stopWrenchLogger(recorder_pid, node->get_logger());
+        RCLCPP_ERROR(node->get_logger(), "Cannot open JSON file: %s", waypoints_abs.c_str());
+        if (manager_pid > 0) stopChildProcess(manager_pid, node->get_logger(), "recording_manager", 20000);
+        for (pid_t pid : recorder_pids) stopChildProcess(pid, node->get_logger());
         return 1;
     }
     json j;
@@ -721,19 +824,15 @@ int main(int argc, char **argv)
 
         auto cfg_it = HANDLE_CONFIG.find(handle_id);
         auto pub_it = publishers.find(handle_id);
+        auto dbg_it = debug_pub_map.find(handle_id);
 
         if (cfg_it == HANDLE_CONFIG.end() || pub_it == publishers.end()) {
             RCLCPP_WARN(node->get_logger(),
-                        "No config/publisher for handle_id %d — skipping.", handle_id);
+                "No config/publisher for handle_id %d — skipping.", handle_id);
             continue;
         }
 
-        DebugPublishers dbg_pubs;
-        if (debug_markers) {
-            auto dbg_it = debug_pub_map.find(handle_id);
-            if (dbg_it != debug_pub_map.end())
-                dbg_pubs = dbg_it->second;
-        }
+        DebugPublishers dbg_pubs = (dbg_it != debug_pub_map.end()) ? dbg_it->second : DebugPublishers{};
 
         threads.emplace_back(publishHandle,
                              node,
@@ -741,19 +840,35 @@ int main(int argc, char **argv)
                              pub_it->second,
                              tf_buffer,
                              t0,
-                             debug_markers,
+                             debug,
                              dbg_pubs);
     }
 
     for (auto &t : threads) t.join();
 
-    RCLCPP_INFO(node->get_logger(), "All handles processed.");
+    if (debug)
+        RCLCPP_INFO(node->get_logger(),
+            "All markers published. Inspect in RViz, then re-run with debug:=false to execute.");
+    else
+        RCLCPP_INFO(node->get_logger(), "All handles processed.");
 
     // ------------------------------------------------------------------
-    // Trajectory is complete — stop the wrench logger so it flushes its
-    // final JSON before this process exits.
+    // Trajectory is complete — stop all recorder processes gracefully.
+    // Stop manager FIRST: it calls stop services on obs/realsense and copies
+    // the OBS file. Then stop obs and realsense (likely already stopped by
+    // the manager, but kill any survivors).
     // ------------------------------------------------------------------
-    stopWrenchLogger(recorder_pid, node->get_logger());
+    if (manager_pid > 0 || !recorder_pids.empty()) {
+        RCLCPP_INFO(node->get_logger(), "Stopping recorder processes...");
+
+        // 1. Manager — handles graceful stop + OBS file copy
+        if (manager_pid > 0)
+            stopChildProcess(manager_pid, node->get_logger(), "recording_manager", 20000);
+
+        // 2. obs + realsense — kill survivors after manager is done
+        for (pid_t pid : recorder_pids)
+            stopChildProcess(pid, node->get_logger(), "", 3000);
+    }
 
     rclcpp::shutdown();
     return 0;
