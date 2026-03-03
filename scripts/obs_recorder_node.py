@@ -22,6 +22,7 @@ Parameters:
   data_dir        str     ""
   auto_record     bool    false
   status_rate_hz  float   1.0
+    (singleton) one instance via /tmp/ignacio_obs_recorder.lock
 
 Dependencies:  pip install obsws-python
 OBS setup:     Tools → WebSocket Server Settings → Enable
@@ -266,7 +267,12 @@ class ObsRecorderNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = ObsRecorderNode()
+    try:
+        node = ObsRecorderNode()
+    except RuntimeError:
+        if rclpy.ok():
+            rclpy.shutdown()
+        return
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

@@ -23,6 +23,9 @@ Parameters:
   data_dir        str     ""
   auto_record     bool    false
   fps             float   30.0
+    enforce_max_fps bool    true
+    auto_detect_fps bool    true
+    fps_warmup_frames int   20
   rgb_topic       str     /camera/camera/color/image_raw
   depth_topic     str     /camera/camera/aligned_depth_to_color/image_raw
   status_rate_hz  float   1.0
@@ -449,7 +452,12 @@ class RealSenseRecorderNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = RealSenseRecorderNode()
+    try:
+        node = RealSenseRecorderNode()
+    except RuntimeError:
+        if rclpy.ok():
+            rclpy.shutdown()
+        return
     try:
         executor = MultiThreadedExecutor(num_threads=4)
         executor.add_node(node)

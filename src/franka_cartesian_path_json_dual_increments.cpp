@@ -2,10 +2,10 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
-#include <std_msgs/msg/string.hpp>                      // ← NEW: for run_folder topic
+#include <std_msgs/msg/string.hpp>
 #include <nlohmann/json.hpp>
 #include <fstream>
-#include <filesystem>                                    // ← NEW: for path manipulation
+#include <filesystem>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -15,8 +15,8 @@
 #include <signal.h>
 #include <thread>
 #include <map>
-#include <chrono>                                        // ← NEW: for timestamp
-#include <ctime>                                         // ← NEW: for localtime_r
+#include <chrono>
+#include <ctime>
 
 // For subprocess management
 #include <sys/types.h>
@@ -29,7 +29,7 @@
 #include <array>
 
 using json = nlohmann::json;
-namespace fs = std::filesystem;                          // ← NEW
+namespace fs = std::filesystem;
 
 std::atomic<bool> g_shutdown_requested(false);
 void signalHandler(int) { g_shutdown_requested = true; }
@@ -53,14 +53,24 @@ static const std::map<int, HandleConfig> HANDLE_CONFIG = {
 //   waypoints = /experiments/test1/action_profiles_displacement.json
 //   records   = /experiments/test1/records
 //   run_dir   = /experiments/test1/records/20260227_160837/
-//       wrench/
+//       wrench_poses/
 //       obs/
 //       realsense/
 // ===========================================================================
 std::string createRunFolder(const std::string &waypoints_abs, const rclcpp::Logger &logger)
 {
-    fs::path parent = fs::path(waypoints_abs).parent_path();
-    fs::path records_root = parent / "records";
+    fs::path waypoints_path = fs::path(waypoints_abs);
+    fs::path parent = waypoints_path.parent_path();
+
+    // Place records in the same experiment target folder.
+    // If waypoints are under .../<target>/gripper_poses/<file>.json,
+    // write to .../<target>/records. Otherwise write to <parent>/records.
+    fs::path records_root;
+    if (parent.filename() == "gripper_poses" && parent.has_parent_path()) {
+        records_root = parent.parent_path() / "records";
+    } else {
+        records_root = parent / "records";
+    }
 
     auto now = std::chrono::system_clock::now();
     std::time_t tt = std::chrono::system_clock::to_time_t(now);
@@ -69,10 +79,24 @@ std::string createRunFolder(const std::string &waypoints_abs, const rclcpp::Logg
     char ts[32];
     std::strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", &tm_local);
 
-    fs::path run_dir = records_root / ts;
+    // Build run name from JSON filename suffix, e.g.:
+    //   action_profiles_curvature chng..json -> curvature chng_20260303_103000
+    std::string stem = waypoints_path.stem().string();
+    const std::string prefix = "action_profiles_";
+    if (stem.rfind(prefix, 0) == 0) {
+        stem = stem.substr(prefix.size());
+    }
+    while (!stem.empty() && (stem.back() == '.' || stem.back() == '_' || stem.back() == '-' || stem.back() == ' ')) {
+        stem.pop_back();
+    }
+    if (stem.empty()) {
+        stem = "run";
+    }
+
+    fs::path run_dir = records_root / (stem + "_" + ts);
 
     try {
-        fs::create_directories(run_dir / "wrench");
+        fs::create_directories(run_dir / "wrench_poses");
         fs::create_directories(run_dir / "obs");
         fs::create_directories(run_dir / "realsense");
     } catch (const std::exception &e) {
@@ -82,7 +106,7 @@ std::string createRunFolder(const std::string &waypoints_abs, const rclcpp::Logg
     }
 
     RCLCPP_INFO(logger, "Run folder created: %s", run_dir.string().c_str());
-    RCLCPP_INFO(logger, "  Subfolders: wrench/  obs/  realsense/");
+    RCLCPP_INFO(logger, "  Subfolders: wrench_poses/  obs/  realsense/");
     return run_dir.string();
 }
 
@@ -571,7 +595,6 @@ void publishHandle(
     const json handle,
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pub,
     std::shared_ptr<tf2_ros::Buffer> tf_buffer,
-    const std::chrono::steady_clock::time_point t0,
     bool debug,
     DebugPublishers debug_pubs)
 {
@@ -905,7 +928,6 @@ int main(int argc, char **argv)
     // ------------------------------------------------------------------
     // Spawn one thread per handle and execute the trajectory
     // ------------------------------------------------------------------
-    const auto t0 = std::chrono::steady_clock::now();
     std::vector<std::thread> threads;
 
     for (const auto &handle : j["handles"])
@@ -929,7 +951,6 @@ int main(int argc, char **argv)
                              handle,
                              pub_it->second,
                              tf_buffer,
-                             t0,
                              debug,
                              dbg_pubs);
     }

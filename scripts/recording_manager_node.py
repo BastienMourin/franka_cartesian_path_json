@@ -13,7 +13,7 @@ published by the C++ trajectory node on /recording_manager/run_folder:
 
   waypoints_file = /test/action_profiles_displacement.json
   run_folder     = /test/20240501_143022/
-      wrench/      ← wrench_logger writes here
+      wrench_poses/← wrench_logger writes here
       obs/         ← obs_recorder writes here
       realsense/   ← realsense_recorder writes here
 
@@ -33,6 +33,7 @@ Parameters (--ros-args -p key:=value):
   enable_wrench             bool    true
   enable_obs                bool    true
   enable_realsense          bool    true
+    copy_obs_from_default     bool    true    copy OBS output from /home/franka2/obs
   wrench_init_timeout       float   3.0     s to wait for wrench_logger init
   obs_service_timeout       float   5.0     s to wait for OBS service
   realsense_service_timeout float   5.0     s to wait for RealSense service
@@ -167,7 +168,7 @@ class RecordingManagerNode(Node):
         """Received from the C++ trajectory node — holds the session root dir."""
         self._run_folder = msg.data
         self.get_logger().info(f'Run folder received: {self._run_folder}')
-        self.get_logger().info(f'  wrench/    → {self._run_folder}/wrench/')
+        self.get_logger().info(f'  wrench_poses/→ {self._run_folder}/wrench_poses/')
         self.get_logger().info(f'  obs/       → {self._run_folder}/obs/')
         self.get_logger().info(f'  realsense/ → {self._run_folder}/realsense/')
 
@@ -187,8 +188,8 @@ class RecordingManagerNode(Node):
         if not os.path.exists(WRENCH_LOGGER_SCRIPT):
             return False, f'Script not found: {WRENCH_LOGGER_SCRIPT}'
 
-        # Pass wrench subfolder directly so the logger doesn't need the topic
-        wrench_dir = os.path.join(self._run_folder, 'wrench') if self._run_folder else ''
+        # Pass wrench_poses subfolder directly so the logger doesn't need the topic
+        wrench_dir = os.path.join(self._run_folder, 'wrench_poses') if self._run_folder else ''
         cmd = [sys.executable, WRENCH_LOGGER_SCRIPT]
         if wrench_dir:
             cmd += ['--ros-args', '-p', f'data_dir:={wrench_dir}']
@@ -325,11 +326,7 @@ class RecordingManagerNode(Node):
 
             if latest_file is None:
                 return False, f'No recent OBS video found in {OBS_DEFAULT_OUTPUT}'
-
-            dest_path = os.path.join(obs_dest, latest_file.name)
-            self.get_logger().info(f'Copying OBS file: {latest_file} → {dest_path}')
-            shutil.copy2(latest_file, dest_path)
-            return True, f'OBS file copied: {latest_file.name}'
+            return self._copy_obs_file_to_run(str(latest_file))
         except Exception as e:
             return False, f'OBS copy failed: {e}'
 
@@ -496,7 +493,12 @@ class RecordingManagerNode(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = RecordingManagerNode()
+    try:
+        node = RecordingManagerNode()
+    except RuntimeError:
+        if rclpy.ok():
+            rclpy.shutdown()
+        return
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:

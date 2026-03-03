@@ -4,8 +4,8 @@ wrench_logger_node.py — Franka dual-arm wrench + TCP pose logger
 =================================================================
 
 Save path priority:
-  1. ROS param  data_dir   — set directly by the C++ launcher (e.g. .../20240501_143022/wrench/)
-  2. Topic      /recording_manager/run_folder  — appends /wrench/ automatically
+    1. ROS param  data_dir   — set directly by the C++ launcher (e.g. .../20240501_143022/wrench_poses/)
+    2. Topic      /recording_manager/run_folder  — appends /wrench_poses/ automatically
   3. Fallback   hardcoded root / timestamped subfolder
 
 Parameters:
@@ -121,7 +121,7 @@ class WrenchLoggerNode(Node):
             return
         if hasattr(self, '_fallback_timer'):
             self._fallback_timer.cancel()
-        save_dir = os.path.join(msg.data, 'wrench')
+        save_dir = os.path.join(msg.data, 'wrench_poses')
         self._init_run_dir(save_dir)
 
     def _fallback_init(self):
@@ -130,7 +130,7 @@ class WrenchLoggerNode(Node):
         if self._run_dir is not None:
             return
         ts       = datetime.now().strftime('%Y%m%d_%H%M%S')
-        save_dir = os.path.join(_FALLBACK_ROOT, ts, 'wrench')
+        save_dir = os.path.join(_FALLBACK_ROOT, ts, 'wrench_poses')
         self.get_logger().warn(
             f'run_folder topic not received — using fallback: {save_dir}')
         self._init_run_dir(save_dir)
@@ -186,6 +186,7 @@ class WrenchLoggerNode(Node):
     # ── Shutdown ──────────────────────────────────────────────────────────────
 
     def _signal_handler(self, signum, frame):
+        """Request graceful shutdown on SIGINT/SIGTERM."""
         self._shutdown_requested = True
 
     def destroy_node(self):
