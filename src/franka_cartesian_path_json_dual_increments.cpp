@@ -781,6 +781,13 @@ int main(int argc, char **argv)
     node->declare_parameter("enable_recording", false);
     bool enable_recording = node->get_parameter("enable_recording").as_bool();
 
+    node->declare_parameter("swap_handle", false);
+    bool swap_handle = node->get_parameter("swap_handle").as_bool();
+    if (swap_handle) {
+        RCLCPP_WARN(node->get_logger(),
+            "swap_handle=true — remapping handle_id 0<->1 before execution.");
+    }
+
     // ------------------------------------------------------------------
     // NEW: Resolve waypoints file to an absolute path
     //
@@ -932,7 +939,19 @@ int main(int argc, char **argv)
 
     for (const auto &handle : j["handles"])
     {
-        int handle_id = handle["handle_id"].get<int>();
+        int original_handle_id = handle["handle_id"].get<int>();
+        int handle_id = original_handle_id;
+        if (swap_handle) {
+            if (original_handle_id == 0) {
+                handle_id = 1;
+            } else if (original_handle_id == 1) {
+                handle_id = 0;
+            }
+            if (handle_id != original_handle_id) {
+                RCLCPP_INFO(node->get_logger(),
+                    "Swapped handle_id %d -> %d", original_handle_id, handle_id);
+            }
+        }
 
         auto cfg_it = HANDLE_CONFIG.find(handle_id);
         auto pub_it = publishers.find(handle_id);
@@ -945,10 +964,12 @@ int main(int argc, char **argv)
         }
 
         DebugPublishers dbg_pubs = (dbg_it != debug_pub_map.end()) ? dbg_it->second : DebugPublishers{};
+        json handle_to_publish = handle;
+        handle_to_publish["handle_id"] = handle_id;
 
         threads.emplace_back(publishHandle,
                              node,
-                             handle,
+                     handle_to_publish,
                              pub_it->second,
                              tf_buffer,
                              debug,
