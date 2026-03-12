@@ -303,15 +303,19 @@ void cleanupStaleRecorderProcesses(const rclcpp::Logger &logger)
 // Debug marker helpers
 //
 // Two topics per handle:
-//   /debug/handle_<N>/waypoints_camera     – raw cumulative_position
-//                                            expressed in camera frame
+//   /debug/handle_<N>/current_waypoints     – measured TCP path
+//                                            in fr3_link0 (start -> current)
 //                                            (LINE_STRIP + spheres)
-//   /debug/handle_<N>/waypoints_link0      – computed target positions
+//   /debug/handle_<N>/planned_waypoints     – computed target positions
 //                                            in fr3_link0
 //                                            (LINE_STRIP + spheres)
+//   /debug/handle_<N>/final_planned_orientation
+//                                          – final planned EE XYZ frame
+//                                            at final planned pose in fr3_link0
+//                                            (3 ARROW markers: X/Y/Z)
 //
 // Colours:
-//   camera  waypoints → cyan   (0, 1, 1)
+//   tracked TCP       → cyan   (0, 1, 1)
 //   link0   waypoints → orange (1, 0.5, 0)
 //
 // Enable with ROS parameter:  --ros-args -p debug_markers:=true
@@ -319,13 +323,14 @@ void cleanupStaleRecorderProcesses(const rclcpp::Logger &logger)
 
 // Per-handle debug publisher pair
 struct DebugPublishers {
-    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr camera_pub;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr tracked_pub;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr link0_pub;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr final_planned_ori_pub;
 };
 
 // Accumulate points; flushed once the whole trajectory is collected
 struct DebugTrajectory {
-    std::vector<geometry_msgs::msg::Point> camera_points;  // in camera frame
+    std::vector<geometry_msgs::msg::Point> tracked_points; // measured TCP in link0
     std::vector<geometry_msgs::msg::Point> link0_points;   // in link0 frame
 };
 
@@ -363,7 +368,7 @@ visualization_msgs::msg::MarkerArray buildMarkerArray(
     spheres.id           = id_offset + 1;
     spheres.type         = visualization_msgs::msg::Marker::SPHERE_LIST;
     spheres.action       = visualization_msgs::msg::Marker::ADD;
-    spheres.scale.x = spheres.scale.y = spheres.scale.z = 0.008;
+    spheres.scale.x = spheres.scale.y = spheres.scale.z = 0.006;
     spheres.color        = line.color;
     spheres.pose.orientation.w = 1.0;
     spheres.points       = points;
@@ -379,11 +384,72 @@ visualization_msgs::msg::MarkerArray buildMarkerArray(
     start_sphere.action             = visualization_msgs::msg::Marker::ADD;
     start_sphere.pose.position      = points.front();
     start_sphere.pose.orientation.w = 1.0;
-    start_sphere.scale.x = start_sphere.scale.y = start_sphere.scale.z = 0.016;
+    start_sphere.scale.x = start_sphere.scale.y = start_sphere.scale.z = 0.012;
     start_sphere.color.r = 1.0f; start_sphere.color.g = 1.0f;
         start_sphere.color.b = 0.0f; start_sphere.color.a = 1.0f;  // yellow = start
     ma.markers.push_back(start_sphere);
     }
+
+    return ma;
+}
+
+visualization_msgs::msg::MarkerArray buildFinalOrientationMarker(
+    const geometry_msgs::msg::Pose &pose,
+    const std::string &frame_id,
+    int id,
+    const rclcpp::Time &stamp)
+{
+    visualization_msgs::msg::MarkerArray ma;
+
+    Eigen::Quaterniond q(
+        pose.orientation.w,
+        pose.orientation.x,
+        pose.orientation.y,
+        pose.orientation.z);
+    q.normalize();
+    Eigen::Matrix3d R = q.toRotationMatrix();
+
+    Eigen::Vector3d p0(pose.position.x, pose.position.y, pose.position.z);
+    const double axis_len = 0.05;
+
+    auto make_axis_arrow = [&](int marker_id,
+                               const Eigen::Vector3d &axis_world,
+                               float r, float g, float b)
+    {
+        visualization_msgs::msg::Marker m;
+        m.header.frame_id = frame_id;
+        m.header.stamp    = stamp;
+        m.ns              = "final_planned_orientation";
+        m.id              = marker_id;
+        m.type            = visualization_msgs::msg::Marker::ARROW;
+        m.action          = visualization_msgs::msg::Marker::ADD;
+        m.scale.x         = 0.005;  // shaft diameter
+        m.scale.y         = 0.008;  // head diameter
+        m.scale.z         = 0.0;     // unused for point-based arrow
+        m.color.r         = r;
+        m.color.g         = g;
+        m.color.b         = b;
+        m.color.a         = 1.0f;
+
+        geometry_msgs::msg::Point start;
+        start.x = p0.x();
+        start.y = p0.y();
+        start.z = p0.z();
+
+        Eigen::Vector3d p1 = p0 + axis_len * axis_world;
+        geometry_msgs::msg::Point end;
+        end.x = p1.x();
+        end.y = p1.y();
+        end.z = p1.z();
+
+        m.points.push_back(start);
+        m.points.push_back(end);
+        ma.markers.push_back(m);
+    };
+
+    make_axis_arrow(id + 0, R.col(0), 1.0f, 0.0f, 0.0f); // X red
+    make_axis_arrow(id + 1, R.col(1), 0.0f, 1.0f, 0.0f); // Y green
+    make_axis_arrow(id + 2, R.col(2), 0.0f, 0.0f, 1.0f); // Z blue
 
     return ma;
 }
@@ -438,6 +504,35 @@ bool getCurrentPose(
         }
     }
     return false;
+}
+
+
+// ===========================================================================
+// One-shot TF lookup for current TCP pose. Quiet helper used for live tracking
+// to avoid excessive per-waypoint logging.
+// ===========================================================================
+bool getCurrentPoseOnceQuiet(
+    const std::string               &source_frame,
+    const std::string               &target_frame,
+    geometry_msgs::msg::PoseStamped &pose_out,
+    tf2_ros::Buffer                 &tf_buffer)
+{
+    try {
+        auto tf = tf_buffer.lookupTransform(
+            target_frame, source_frame,
+            tf2::TimePointZero,
+            tf2::durationFromSec(0.05));
+
+        pose_out.header.frame_id  = target_frame;
+        pose_out.header.stamp     = tf.header.stamp;
+        pose_out.pose.position.x  = tf.transform.translation.x;
+        pose_out.pose.position.y  = tf.transform.translation.y;
+        pose_out.pose.position.z  = tf.transform.translation.z;
+        pose_out.pose.orientation = tf.transform.rotation;
+        return true;
+    } catch (const tf2::TransformException &) {
+        return false;
+    }
 }
 
 
@@ -617,22 +712,23 @@ void publishHandle(
     }
 
     RCLCPP_INFO(node->get_logger(),
-        "[handle %d] Pre-computing trajectory markers...", handle_id);
+        "[handle %d] Pre-computing planned trajectory markers...", handle_id);
 
     DebugTrajectory debug_traj;
+    bool has_final_planned_pose = false;
+    geometry_msgs::msg::Pose final_planned_pose;
+
+    geometry_msgs::msg::Point start_pt;
+    start_pt.x = start_pose_in_link0.pose.position.x;
+    start_pt.y = start_pose_in_link0.pose.position.y;
+    start_pt.z = start_pose_in_link0.pose.position.z;
+    debug_traj.tracked_points.push_back(start_pt);
 
     for (const auto &wp : handle["waypoints"])
     {
         if (g_shutdown_requested) break;
 
-            // Camera-frame point (raw cumulative_position)
-        geometry_msgs::msg::Point cam_pt;
-        cam_pt.x = wp["cumulative_position"][0].get<double>();
-        cam_pt.y = wp["cumulative_position"][1].get<double>();
-        cam_pt.z = wp["cumulative_position"][2].get<double>();
-        debug_traj.camera_points.push_back(cam_pt);
-
-            // Link0-frame point (start_pose + rotated delta)
+            // Link0-frame planned point (start_pose + rotated delta)
         geometry_msgs::msg::Vector3 raw_delta_pos;
         raw_delta_pos.x = wp["cumulative_position"][0].get<double>();
         raw_delta_pos.y = wp["cumulative_position"][1].get<double>();
@@ -653,22 +749,50 @@ void publishHandle(
         link0_pt.y = start_pose_in_link0.pose.position.y + delta_in_link0.y;
         link0_pt.z = start_pose_in_link0.pose.position.z + delta_in_link0.z;
         debug_traj.link0_points.push_back(link0_pt);
+
+        geometry_msgs::msg::Quaternion raw_delta_ori;
+        raw_delta_ori.w = wp["cumulative_quaternion_wxyz"][0].get<double>();
+        raw_delta_ori.x = wp["cumulative_quaternion_wxyz"][1].get<double>();
+        raw_delta_ori.y = wp["cumulative_quaternion_wxyz"][2].get<double>();
+        raw_delta_ori.z = wp["cumulative_quaternion_wxyz"][3].get<double>();
+
+        geometry_msgs::msg::Quaternion delta_ori_in_link0;
+        if (!rotateDeltaOrientation(raw_delta_ori, frame_id, control_frame,
+                                    delta_ori_in_link0, *tf_buffer,
+                                    node->get_logger()))
+        {
+            RCLCPP_WARN(node->get_logger(),
+                "[handle %d] Could not rotate waypoint orientation for final marker, skipping.", handle_id);
+            continue;
+        }
+
+        geometry_msgs::msg::Pose delta_pose_in_link0;
+        delta_pose_in_link0.position    = delta_in_link0;
+        delta_pose_in_link0.orientation = delta_ori_in_link0;
+
+        final_planned_pose = applyDeltaPose(start_pose_in_link0.pose, delta_pose_in_link0, node->get_logger());
+        has_final_planned_pose = true;
     }
 
-        // Publish camera-frame markers (cyan)
+        // Publish initial tracked path (start only) in cyan
     auto stamp = node->get_clock()->now();
-    debug_pubs.camera_pub->publish(buildMarkerArray(
-        debug_traj.camera_points, frame_id,
+    debug_pubs.tracked_pub->publish(buildMarkerArray(
+        debug_traj.tracked_points, control_frame,
         0.0f, 1.0f, 1.0f, handle_id * 10, stamp));
 
     debug_pubs.link0_pub->publish(buildMarkerArray(
         debug_traj.link0_points, control_frame,
         1.0f, 0.5f, 0.0f, handle_id * 10, stamp));
 
+    if (has_final_planned_pose) {
+        debug_pubs.final_planned_ori_pub->publish(buildFinalOrientationMarker(
+            final_planned_pose, control_frame, handle_id * 10 + 100, stamp));
+    }
+
     RCLCPP_INFO(node->get_logger(),
-        "[handle %d] Markers published — %zu camera pts, %zu link0 pts.",
+        "[handle %d] Markers published — %zu tracked pts, %zu planned pts.",
         handle_id,
-        debug_traj.camera_points.size(),
+        debug_traj.tracked_points.size(),
         debug_traj.link0_points.size());
 
     if (debug) {
@@ -745,6 +869,20 @@ void publishHandle(
         target_stamped.pose            = target_pose;
 
         pub->publish(target_stamped);
+
+        geometry_msgs::msg::PoseStamped current_pose_in_link0;
+        if (getCurrentPoseOnceQuiet(tcp_frame, control_frame, current_pose_in_link0, *tf_buffer)) {
+            geometry_msgs::msg::Point current_pt;
+            current_pt.x = current_pose_in_link0.pose.position.x;
+            current_pt.y = current_pose_in_link0.pose.position.y;
+            current_pt.z = current_pose_in_link0.pose.position.z;
+            debug_traj.tracked_points.push_back(current_pt);
+
+            debug_pubs.tracked_pub->publish(buildMarkerArray(
+                debug_traj.tracked_points, control_frame,
+                0.0f, 1.0f, 1.0f, handle_id * 10, node->get_clock()->now()));
+        }
+
         RCLCPP_INFO(node->get_logger(), "[handle %d] Published target pose at t=%.2f", handle_id, t);
     }
 
@@ -770,13 +908,15 @@ int main(int argc, char **argv)
     if (debug)
         RCLCPP_WARN(node->get_logger(),
             "debug=true — markers will be published but the robot will NOT move. "
-            "Subscribe to /debug/handle_<N>/waypoints_camera and "
-            "/debug/handle_<N>/waypoints_link0 in RViz.");
+            "Subscribe to /debug/handle_<N>/current_waypoints and "
+            "/debug/handle_<N>/planned_waypoints and "
+            "/debug/handle_<N>/final_planned_orientation in RViz.");
     else
         RCLCPP_INFO(node->get_logger(),
             "debug=false — markers will be published and trajectory will execute. "
-            "Subscribe to /debug/handle_<N>/waypoints_camera and "
-            "/debug/handle_<N>/waypoints_link0 in RViz.");
+            "Subscribe to /debug/handle_<N>/current_waypoints and "
+            "/debug/handle_<N>/planned_waypoints and "
+            "/debug/handle_<N>/final_planned_orientation in RViz.");
 
     node->declare_parameter("enable_recording", false);
     bool enable_recording = node->get_parameter("enable_recording").as_bool();
@@ -908,14 +1048,16 @@ int main(int argc, char **argv)
             "Publisher handle_id %d -> %s  (base frame: %s)",
             handle_id, topic.c_str(), cfg.base_frame.c_str());
 
-        std::string cam_topic   = "/debug/handle_" + std::to_string(handle_id) + "/waypoints_camera";
-        std::string link0_topic = "/debug/handle_" + std::to_string(handle_id) + "/waypoints_link0";
+        std::string tracked_topic = "/debug/handle_" + std::to_string(handle_id) + "/current_waypoints";
+        std::string link0_topic = "/debug/handle_" + std::to_string(handle_id) + "/planned_waypoints";
+        std::string final_ori_topic = "/debug/handle_" + std::to_string(handle_id) + "/final_planned_orientation";
             // transient_local = latched: late subscribers still receive the message
             // depth=10 ensures RViz can retrieve markers even after toggling display
         auto qos = rclcpp::QoS(10).transient_local();
         debug_pub_map[handle_id] = {
-            node->create_publisher<visualization_msgs::msg::MarkerArray>(cam_topic,   qos),
-            node->create_publisher<visualization_msgs::msg::MarkerArray>(link0_topic, qos)
+            node->create_publisher<visualization_msgs::msg::MarkerArray>(tracked_topic, qos),
+            node->create_publisher<visualization_msgs::msg::MarkerArray>(link0_topic, qos),
+            node->create_publisher<visualization_msgs::msg::MarkerArray>(final_ori_topic, qos)
         };
     }
 
